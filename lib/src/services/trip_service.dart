@@ -22,6 +22,44 @@ class TripService {
 
   TripService();
 
+  /// Load a routing graph from raw Overpass `elements` data.
+  ///
+  /// This enables callers to prepare Overpass JSON separately and then route
+  /// offline without triggering a live Overpass request during [findTotalTrip].
+  Future<void> loadOverpassElements(
+    List<dynamic> elements, {
+    bool preferWalkingPaths = true,
+    int minIslandSize = 0,
+    String source = 'custom',
+  }) async {
+    graph = _parseGraph(
+      elements,
+      preferWalkingPaths,
+      minIslandSize: minIslandSize,
+    );
+    currentCity = source;
+  }
+
+  /// Load a routing graph from a decoded Overpass JSON response.
+  Future<void> loadOverpassJson(
+    Map<String, dynamic> json, {
+    bool preferWalkingPaths = true,
+    int minIslandSize = 0,
+    String source = 'custom',
+  }) async {
+    final elements = json['elements'];
+    if (elements is! List) {
+      throw const FormatException('Expected top-level "elements" list.');
+    }
+
+    await loadOverpassElements(
+      elements,
+      preferWalkingPaths: preferWalkingPaths,
+      minIslandSize: minIslandSize,
+      source: source,
+    );
+  }
+
   /// Fetch OSM walking path ways/nodes in given bounds.
   ///
   /// Returns an empty list if parsing fails, data is incomplete, or API fails.
@@ -142,7 +180,11 @@ class TripService {
   /// Parse a list of OSM nodes and ways to build a routing graph.
   ///
   /// Returns an empty graph if no valid nodes.
-  Graph _parseGraph(List elements, bool preferWalkingPaths) {
+  Graph _parseGraph(
+    List elements,
+    bool preferWalkingPaths, {
+    int minIslandSize = 100,
+  }) {
     final graph = Graph();
 
     // Safe node extraction
@@ -203,7 +245,10 @@ class TripService {
     }
 
     // Remove unrealistically tiny islands
-    return _removeNodeIslands(graph, 100);
+    if (minIslandSize <= 0) {
+      return graph;
+    }
+    return _removeNodeIslands(graph, minIslandSize);
   }
 
   /// Find the closest node id in graph for each position.

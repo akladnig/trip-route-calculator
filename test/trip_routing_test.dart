@@ -3,6 +3,57 @@ import 'package:trip_routing/trip_routing.dart';
 import 'package:latlong2/latlong.dart';
 
 void main() {
+  group('TripService local Overpass loaders', () {
+    test('loadOverpassJson builds an offline graph', () async {
+      final routing = TripService();
+
+      await routing.loadOverpassJson({
+        'elements': [
+          {
+            'type': 'node',
+            'id': 1,
+            'lat': 50.0,
+            'lon': 6.0,
+          },
+          {
+            'type': 'node',
+            'id': 2,
+            'lat': 50.0,
+            'lon': 6.001,
+          },
+          {
+            'type': 'way',
+            'id': 10,
+            'nodes': [1, 2],
+            'tags': {'highway': 'path', 'footway': 'sidewalk'},
+          },
+        ],
+      }, source: 'fixture');
+
+      expect(routing.currentCity, 'fixture');
+      expect(routing.graph.nodes.keys, containsAll([1, 2]));
+      expect(routing.graph.adjacencyList[1], isNotEmpty);
+
+      final trip = await routing.findTotalTrip([
+        const LatLng(50.0, 6.0),
+        const LatLng(50.0, 6.001),
+      ]);
+
+      expect(trip.errors, isEmpty);
+      expect(trip.route.length, greaterThanOrEqualTo(2));
+      expect(trip.distance, greaterThan(0));
+    });
+
+    test('loadOverpassJson rejects missing elements list', () async {
+      final routing = TripService();
+
+      expect(
+        () => routing.loadOverpassJson(const {}),
+        throwsFormatException,
+      );
+    });
+  });
+
   group('TripService', () {
     final waypoints = [
       const LatLng(50.77437074991441, 6.075419266272186),
