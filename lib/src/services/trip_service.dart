@@ -21,7 +21,17 @@ class TripService {
   /// The main graph used for routing.
   late Graph graph;
 
+  List<Node>? _graphNodesCache;
+  List<_GraphSegment>? _graphSegmentsCache;
+
   TripService();
+
+  void _setGraph(Graph nextGraph, {String? source}) {
+    graph = nextGraph;
+    currentCity = source;
+    _graphNodesCache = null;
+    _graphSegmentsCache = null;
+  }
 
   bool get _hasLoadedGraph {
     try {
@@ -42,12 +52,14 @@ class TripService {
     int minIslandSize = 0,
     String source = 'custom',
   }) async {
-    graph = _parseGraph(
-      elements,
-      preferWalkingPaths,
-      minIslandSize: minIslandSize,
+    _setGraph(
+      _parseGraph(
+        elements,
+        preferWalkingPaths,
+        minIslandSize: minIslandSize,
+      ),
+      source: source,
     );
-    currentCity = source;
   }
 
   /// Load a routing graph from a decoded Overpass JSON response.
@@ -270,6 +282,11 @@ class TripService {
   }
 
   List<_GraphSegment> _uniqueSegments(Graph graph) {
+    final cached = _graphSegmentsCache;
+    if (cached != null) {
+      return cached;
+    }
+
     final segments = <_GraphSegment>[];
     final seen = <String>{};
     for (final entry in graph.adjacencyList.entries) {
@@ -289,7 +306,18 @@ class TripService {
         segments.add(_GraphSegment(edge, startNode, endNode));
       }
     }
-    return segments;
+    return _graphSegmentsCache = List<_GraphSegment>.unmodifiable(segments);
+  }
+
+  List<Node> _graphNodes(Graph graph) {
+    final cached = _graphNodesCache;
+    if (cached != null) {
+      return cached;
+    }
+
+    return _graphNodesCache = List<Node>.unmodifiable(
+      graph.nodes.values.toList(growable: false),
+    );
   }
 
   _ProjectedPoint _projectPointToSegment(
@@ -317,9 +345,8 @@ class TripService {
     final lengthSquared = dx * dx + dy * dy;
     final unclampedT = lengthSquared <= 0
         ? 0.0
-        : (((pointXY.x - startXY.x) * dx) +
-                    ((pointXY.y - startXY.y) * dy)) /
-                lengthSquared;
+        : (((pointXY.x - startXY.x) * dx) + ((pointXY.y - startXY.y) * dy)) /
+            lengthSquared;
     final t = unclampedT.clamp(0.0, 1.0);
     final projectedLat = startNode.lat + (endNode.lat - startNode.lat) * t;
     final projectedLon = startNode.lon + (endNode.lon - startNode.lon) * t;
@@ -340,7 +367,7 @@ class TripService {
   ) {
     Node? closestNode;
     var closestNodeDistance = double.infinity;
-    for (final node in graph.nodes.values) {
+    for (final node in _graphNodes(graph)) {
       final distance = haversineDistance(
         point.latitude,
         point.longitude,
@@ -367,7 +394,8 @@ class TripService {
 
     _EndpointClassification? bestMatch;
     for (final segment in _uniqueSegments(graph)) {
-      final projected = _projectPointToSegment(point, segment.startNode, segment.endNode);
+      final projected =
+          _projectPointToSegment(point, segment.startNode, segment.endNode);
       if (projected.distanceMeters > maxSnapDistanceMeters) {
         continue;
       }
@@ -408,7 +436,8 @@ class TripService {
       );
     }
 
-    final classification = _classifyEndpoint(graph, point, maxSnapDistanceMeters);
+    final classification =
+        _classifyEndpoint(graph, point, maxSnapDistanceMeters);
     return EndpointProbeResult(
       isOnTrack: classification.isOnTrack,
       anchor: classification.anchor,
@@ -416,14 +445,72 @@ class TripService {
     );
   }
 
-  int _nextSyntheticNodeId(Graph graph, int currentMinId) {
-    final minId = graph.nodes.keys.isEmpty
-        ? currentMinId
-        : graph.nodes.keys.reduce(math.min);
-    return math.min(currentMinId, minId) - 1;
+  double _weightedTransitionCost(
+      Graph graph, int nodeId, double distanceMeters) {
+    final isFootWay = graph.nodes[nodeId]?.isFootWay ?? false;
+    return distanceMeters * (isFootWay ? 0.95 : 1.0);
   }
 
-  AnchoredSegmentResult _routeThroughOverlay(
+  List<_EndpointTransition> _endpointTransitions(
+    Graph graph,
+    _EndpointClassification classification,
+  ) {
+    final graphNodeId = classification.graphNodeId;
+    if (graphNodeId != null) {
+      return [
+        _EndpointTransition(
+          nodeId: graphNodeId,
+          distanceMeters: 0.0,
+          weightedDistance: 0.0,
+        ),
+      ];
+    }
+
+    final fromId = classification.segmentFromNodeId;
+    final toId = classification.segmentToNodeId;
+    final fraction = classification.fractionAlongSegment;
+    if (fromId == null || toId == null || fraction == null) {
+      return const [];
+    }
+
+    final fromNode = graph.nodes[fromId];
+    final toNode = graph.nodes[toId];
+    if (fromNode == null || toNode == null) {
+      return const [];
+    }
+
+    final totalDistance = haversineDistance(
+      fromNode.lat,
+      fromNode.lon,
+      toNode.lat,
+      toNode.lon,
+    );
+    final transitions = <int, _EndpointTransition>{};
+
+    void addTransition(int nodeId, double distanceMeters) {
+      final weightedDistance = _weightedTransitionCost(
+        graph,
+        nodeId,
+        distanceMeters,
+      );
+      final candidate = _EndpointTransition(
+        nodeId: nodeId,
+        distanceMeters: distanceMeters,
+        weightedDistance: weightedDistance,
+      );
+      final existing = transitions[nodeId];
+      if (existing == null ||
+          candidate.weightedDistance < existing.weightedDistance) {
+        transitions[nodeId] = candidate;
+      }
+    }
+
+    addTransition(fromId, totalDistance * fraction);
+    addTransition(toId, totalDistance * (1.0 - fraction));
+    return transitions.values.toList(growable: false);
+  }
+
+  AnchoredSegmentResult _routeThroughAnchors(
     Graph baseGraph,
     _EndpointClassification start,
     _EndpointClassification end,
@@ -457,93 +544,164 @@ class TripService {
       );
     }
 
-    final overlay = baseGraph.clone();
-    var syntheticId = 0;
-
-    int resolveNodeId(_EndpointClassification classification) {
-      final nodeId = classification.graphNodeId;
-      if (nodeId != null) {
-        return nodeId;
-      }
-
-      final fromId = classification.segmentFromNodeId;
-      final toId = classification.segmentToNodeId;
-      final fraction = classification.fractionAlongSegment;
-      final anchor = classification.anchor;
-      if (fromId == null || toId == null || fraction == null || anchor == null) {
-        throw StateError('Missing synthetic anchor routing metadata.');
-      }
-
-      syntheticId = _nextSyntheticNodeId(overlay, syntheticId);
-      final fromNode = overlay.nodes[fromId]!;
-      final toNode = overlay.nodes[toId]!;
-      overlay.addNode(
-        Node(
-          syntheticId,
-          anchor.point.latitude,
-          anchor.point.longitude,
-          fromNode.isFootWay || toNode.isFootWay,
-        ),
-      );
-
-      final segmentId = classification.originalSegmentId;
-      final totalWeight = haversineDistance(
-        fromNode.lat,
-        fromNode.lon,
-        toNode.lat,
-        toNode.lon,
-      );
-      overlay.addEdge(
-        Edge(
-          fromId,
-          syntheticId,
-          totalWeight * fraction,
-          originalSegmentId: segmentId,
-        ),
-      );
-      overlay.addEdge(
-        Edge(
-          syntheticId,
-          toId,
-          totalWeight * (1.0 - fraction),
-          originalSegmentId: segmentId,
-        ),
-      );
-      return syntheticId;
-    }
-
-    try {
-      final startId = resolveNodeId(start);
-      final endId = resolveNodeId(end);
-      final trip = shortestPath(overlay, startId, endId);
-      if (trip.errors.isNotEmpty || trip.route.length < 2 || trip.distance <= 0) {
-        return AnchoredSegmentResult(
-          status: AnchoredSegmentStatus.noPath,
-          route: const [],
-          distance: 0.0,
-          errors: const [],
-          startAnchor: start.anchor,
-          endAnchor: end.anchor,
-        );
-      }
-      return AnchoredSegmentResult(
-        status: AnchoredSegmentStatus.routed,
-        route: trip.route,
-        distance: trip.distance,
-        errors: const [],
-        startAnchor: start.anchor,
-        endAnchor: end.anchor,
-      );
-    } catch (error) {
+    final startTransitions = _endpointTransitions(baseGraph, start);
+    final endTransitions = _endpointTransitions(baseGraph, end);
+    if (startTransitions.isEmpty || endTransitions.isEmpty) {
       return AnchoredSegmentResult(
         status: AnchoredSegmentStatus.failed,
         route: const [],
         distance: 0.0,
-        errors: ['$error'],
+        errors: const ['Missing synthetic anchor routing metadata.'],
         startAnchor: start.anchor,
         endAnchor: end.anchor,
       );
     }
+
+    final actualDistances = <int, double>{};
+    final weightedDistances = <int, double>{};
+    final previousNodes = <int, int>{};
+    final visited = <int>{};
+    final priorityQueue = PriorityQueue<MapEntry<int, double>>(
+      (a, b) => a.value.compareTo(b.value),
+    );
+
+    for (final nodeId in baseGraph.nodes.keys) {
+      actualDistances[nodeId] = double.infinity;
+      weightedDistances[nodeId] = double.infinity;
+    }
+
+    for (final transition in startTransitions) {
+      if (!baseGraph.nodes.containsKey(transition.nodeId)) {
+        continue;
+      }
+
+      if (transition.weightedDistance <
+          (weightedDistances[transition.nodeId] ?? double.infinity)) {
+        actualDistances[transition.nodeId] = transition.distanceMeters;
+        weightedDistances[transition.nodeId] = transition.weightedDistance;
+        previousNodes.remove(transition.nodeId);
+        priorityQueue.add(
+          MapEntry(transition.nodeId, transition.weightedDistance),
+        );
+      }
+    }
+
+    if (priorityQueue.isEmpty) {
+      return AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.noPath,
+        route: const [],
+        distance: 0.0,
+        errors: const [],
+        startAnchor: start.anchor,
+        endAnchor: end.anchor,
+      );
+    }
+
+    final endTransitionsByNode = <int, _EndpointTransition>{};
+    for (final transition in endTransitions) {
+      final existing = endTransitionsByNode[transition.nodeId];
+      if (existing == null ||
+          transition.weightedDistance < existing.weightedDistance) {
+        endTransitionsByNode[transition.nodeId] = transition;
+      }
+    }
+
+    int? bestEndNodeId;
+    var bestEndActualDistance = double.infinity;
+    var bestEndWeightedDistance = double.infinity;
+
+    while (priorityQueue.isNotEmpty) {
+      final currentNodeId = priorityQueue.removeFirst().key;
+      if (!visited.add(currentNodeId)) {
+        continue;
+      }
+
+      final currentWeightedDistance =
+          weightedDistances[currentNodeId] ?? double.infinity;
+      if (currentWeightedDistance > bestEndWeightedDistance) {
+        break;
+      }
+
+      final endTransition = endTransitionsByNode[currentNodeId];
+      if (endTransition != null) {
+        final candidateWeightedDistance =
+            currentWeightedDistance + endTransition.weightedDistance;
+        if (candidateWeightedDistance < bestEndWeightedDistance) {
+          bestEndNodeId = currentNodeId;
+          bestEndWeightedDistance = candidateWeightedDistance;
+          bestEndActualDistance =
+              (actualDistances[currentNodeId] ?? double.infinity) +
+                  endTransition.distanceMeters;
+        }
+      }
+
+      for (final edge in baseGraph.adjacencyList[currentNodeId] ?? const []) {
+        if (visited.contains(edge.to)) {
+          continue;
+        }
+
+        final isFootWay = baseGraph.nodes[edge.to]?.isFootWay ?? false;
+        final footwayPenalty = isFootWay ? 0.95 : 1.0;
+        final weight =
+            (edge.weight.isFinite && edge.weight > 0) ? edge.weight : 1.0;
+        final newActualDistance =
+            (actualDistances[currentNodeId] ?? double.infinity) + weight;
+        final newWeightedDistance =
+            currentWeightedDistance + weight * footwayPenalty;
+
+        if (newWeightedDistance <
+            (weightedDistances[edge.to] ?? double.infinity)) {
+          actualDistances[edge.to] = newActualDistance;
+          weightedDistances[edge.to] = newWeightedDistance;
+          previousNodes[edge.to] = currentNodeId;
+          priorityQueue.add(MapEntry(edge.to, newWeightedDistance));
+        }
+      }
+    }
+
+    if (bestEndNodeId == null ||
+        !bestEndActualDistance.isFinite ||
+        bestEndActualDistance <= 0) {
+      return AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.noPath,
+        route: const [],
+        distance: 0.0,
+        errors: const [],
+        startAnchor: start.anchor,
+        endAnchor: end.anchor,
+      );
+    }
+
+    final pathNodeIds = <int>[bestEndNodeId];
+    var currentNodeId = bestEndNodeId;
+    while (previousNodes.containsKey(currentNodeId)) {
+      currentNodeId = previousNodes[currentNodeId]!;
+      pathNodeIds.add(currentNodeId);
+    }
+
+    final route = pathNodeIds.reversed
+        .map((nodeId) => baseGraph.nodes[nodeId])
+        .whereType<Node>()
+        .map((node) => LatLng(node.lat, node.lon))
+        .toList(growable: true);
+
+    final startPoint = start.anchor!.point;
+    final endPoint = end.anchor!.point;
+    if (route.isEmpty || route.first != startPoint) {
+      route.insert(0, startPoint);
+    }
+    if (route.isEmpty || route.last != endPoint) {
+      route.add(endPoint);
+    }
+
+    return AnchoredSegmentResult(
+      status: AnchoredSegmentStatus.routed,
+      route: List<LatLng>.unmodifiable(route),
+      distance: bestEndActualDistance,
+      errors: const [],
+      startAnchor: start.anchor,
+      endAnchor: end.anchor,
+    );
   }
 
   Future<AnchoredSegmentResult> findAnchoredSegment({
@@ -560,8 +718,10 @@ class TripService {
       );
     }
 
-    final startClassification = _classifyEndpoint(graph, start, maxSnapDistanceMeters);
-    final endClassification = _classifyEndpoint(graph, end, maxSnapDistanceMeters);
+    final startClassification =
+        _classifyEndpoint(graph, start, maxSnapDistanceMeters);
+    final endClassification =
+        _classifyEndpoint(graph, end, maxSnapDistanceMeters);
     if (!startClassification.isOnTrack || !endClassification.isOnTrack) {
       return AnchoredSegmentResult(
         status: AnchoredSegmentStatus.offTrack,
@@ -573,7 +733,7 @@ class TripService {
       );
     }
 
-    return _routeThroughOverlay(graph, startClassification, endClassification);
+    return _routeThroughAnchors(graph, startClassification, endClassification);
   }
 
   /// Find the closest node id in graph for each position.
@@ -821,7 +981,7 @@ class TripService {
       } else {
         foundEntrance = List.filled(waypoints.length, false);
       }
-      graph = await _fetchGraph(bounds, preferWalkingPaths);
+      _setGraph(await _fetchGraph(bounds, preferWalkingPaths));
     } else {
       foundEntrance = List.filled(waypoints.length, false);
     }
@@ -921,8 +1081,7 @@ class TripService {
   Future<bool> useCity(String cityName) async {
     final filePath = await getCityPath(cityName);
     try {
-      graph = await Graph().loadGraph(filePath);
-      currentCity = cityName;
+      _setGraph(await Graph().loadGraph(filePath), source: cityName);
       return true;
     } catch (_) {
       final boundingBox = await _fetchBoundingBox(cityName);
@@ -930,12 +1089,14 @@ class TripService {
         // print('Could not fetch bounding box for $cityName.');
         return false;
       }
-      currentCity = cityName;
       final minLat = boundingBox['minLat']!;
       final minLon = boundingBox['minLon']!;
       final maxLat = boundingBox['maxLat']!;
       final maxLon = boundingBox['maxLon']!;
-      graph = await _fetchGraph([minLat, minLon, maxLat, maxLon], true);
+      _setGraph(
+        await _fetchGraph([minLat, minLon, maxLat, maxLon], true),
+        source: cityName,
+      );
       await graph.saveGraph(filePath);
       return true;
     }
@@ -1015,4 +1176,16 @@ class _EndpointClassification {
   final int? segmentToNodeId;
   final double? fractionAlongSegment;
   final double? distanceToGraphMeters;
+}
+
+class _EndpointTransition {
+  const _EndpointTransition({
+    required this.nodeId,
+    required this.distanceMeters,
+    required this.weightedDistance,
+  });
+
+  final int nodeId;
+  final double distanceMeters;
+  final double weightedDistance;
 }
