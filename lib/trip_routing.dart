@@ -4,6 +4,7 @@ export 'src/models/node.dart';
 export 'src/models/graph.dart';
 export 'src/models/edge.dart';
 export 'src/models/trip.dart';
+export 'src/models/anchored_segment.dart';
 export 'src/services/trip_service.dart';
 export 'src/utils/haversine.dart';
 export 'src/utils/bounds_calculator.dart';

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:latlong2/latlong.dart';
 import 'package:collection/collection.dart';
 import 'package:http/http.dart' as http;
@@ -21,6 +22,15 @@ class TripService {
   late Graph graph;
 
   TripService();
+
+  bool get _hasLoadedGraph {
+    try {
+      graph.nodes;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 
   /// Load a routing graph from raw Overpass `elements` data.
   ///
@@ -215,6 +225,7 @@ class TripService {
       if (element['type'] == 'way') {
         final List nodes = (element['nodes'] is List) ? element['nodes'] : [];
         final Map<String, dynamic> tags = element['tags'] ?? {};
+        final wayId = element['id'];
         final isFootWay = preferWalkingPaths &&
             (tags.containsKey('footway') || tags.containsKey('pedestrian'));
 
@@ -238,7 +249,14 @@ class TripService {
           final safeDist = (dist.isFinite && dist >= 0) ? dist : 0.0;
           // Only add edge if real, meaningful length
           if (safeDist > 0.1) {
-            graph.addEdge(Edge(startIndex, endIndex, safeDist));
+            graph.addEdge(
+              Edge(
+                startIndex,
+                endIndex,
+                safeDist,
+                originalSegmentId: wayId is int ? '$wayId:$i' : 'way:$i',
+              ),
+            );
           }
         }
       }
@@ -249,6 +267,313 @@ class TripService {
       return graph;
     }
     return _removeNodeIslands(graph, minIslandSize);
+  }
+
+  List<_GraphSegment> _uniqueSegments(Graph graph) {
+    final segments = <_GraphSegment>[];
+    final seen = <String>{};
+    for (final entry in graph.adjacencyList.entries) {
+      for (final edge in entry.value) {
+        final startNode = graph.nodes[edge.from];
+        final endNode = graph.nodes[edge.to];
+        if (startNode == null || endNode == null) {
+          continue;
+        }
+        final orderedFrom = edge.from < edge.to ? edge.from : edge.to;
+        final orderedTo = edge.from < edge.to ? edge.to : edge.from;
+        final id = edge.originalSegmentId ?? 'legacy:$orderedFrom:$orderedTo';
+        final key = '$id:$orderedFrom:$orderedTo';
+        if (!seen.add(key)) {
+          continue;
+        }
+        segments.add(_GraphSegment(edge, startNode, endNode));
+      }
+    }
+    return segments;
+  }
+
+  _ProjectedPoint _projectPointToSegment(
+    LatLng point,
+    Node startNode,
+    Node endNode,
+  ) {
+    const earthRadius = 6371000.0;
+    final latRef = point.latitude * math.pi / 180.0;
+
+    ({double x, double y}) toXY(double lat, double lon) {
+      final latRad = lat * math.pi / 180.0;
+      final lonRad = lon * math.pi / 180.0;
+      return (
+        x: earthRadius * lonRad * math.cos(latRef),
+        y: earthRadius * latRad,
+      );
+    }
+
+    final pointXY = toXY(point.latitude, point.longitude);
+    final startXY = toXY(startNode.lat, startNode.lon);
+    final endXY = toXY(endNode.lat, endNode.lon);
+    final dx = endXY.x - startXY.x;
+    final dy = endXY.y - startXY.y;
+    final lengthSquared = dx * dx + dy * dy;
+    final unclampedT = lengthSquared <= 0
+        ? 0.0
+        : (((pointXY.x - startXY.x) * dx) +
+                    ((pointXY.y - startXY.y) * dy)) /
+                lengthSquared;
+    final t = unclampedT.clamp(0.0, 1.0);
+    final projectedLat = startNode.lat + (endNode.lat - startNode.lat) * t;
+    final projectedLon = startNode.lon + (endNode.lon - startNode.lon) * t;
+    final projectedPoint = LatLng(projectedLat, projectedLon);
+    final distanceMeters = haversineDistance(
+      point.latitude,
+      point.longitude,
+      projectedPoint.latitude,
+      projectedPoint.longitude,
+    );
+    return _ProjectedPoint(projectedPoint, t.toDouble(), distanceMeters);
+  }
+
+  _EndpointClassification _classifyEndpoint(
+    Graph graph,
+    LatLng point,
+    double maxSnapDistanceMeters,
+  ) {
+    Node? closestNode;
+    var closestNodeDistance = double.infinity;
+    for (final node in graph.nodes.values) {
+      final distance = haversineDistance(
+        point.latitude,
+        point.longitude,
+        node.lat,
+        node.lon,
+      );
+      if (distance < closestNodeDistance) {
+        closestNodeDistance = distance;
+        closestNode = node;
+      }
+    }
+
+    if (closestNode != null && closestNodeDistance <= maxSnapDistanceMeters) {
+      return _EndpointClassification(
+        isOnTrack: true,
+        anchor: EndpointAnchor(
+          point: LatLng(closestNode.lat, closestNode.lon),
+          type: EndpointAnchorType.node,
+          nodeId: closestNode.id,
+        ),
+        graphNodeId: closestNode.id,
+      );
+    }
+
+    _EndpointClassification? bestMatch;
+    for (final segment in _uniqueSegments(graph)) {
+      final projected = _projectPointToSegment(point, segment.startNode, segment.endNode);
+      if (projected.distanceMeters > maxSnapDistanceMeters) {
+        continue;
+      }
+
+      final candidate = _EndpointClassification(
+        isOnTrack: true,
+        anchor: EndpointAnchor(
+          point: projected.point,
+          type: EndpointAnchorType.edgeProjection,
+          originalSegmentId: segment.edge.originalSegmentId,
+        ),
+        originalSegmentId: segment.edge.originalSegmentId,
+        segmentFromNodeId: segment.startNode.id,
+        segmentToNodeId: segment.endNode.id,
+        fractionAlongSegment: projected.fraction,
+        distanceToGraphMeters: projected.distanceMeters,
+      );
+      if (bestMatch == null ||
+          candidate.distanceToGraphMeters! < bestMatch.distanceToGraphMeters!) {
+        bestMatch = candidate;
+      }
+    }
+
+    return bestMatch ??
+        const _EndpointClassification(
+          isOnTrack: false,
+        );
+  }
+
+  Future<EndpointProbeResult> probeEndpointAnchor({
+    required LatLng point,
+    required double maxSnapDistanceMeters,
+  }) async {
+    if (!_hasLoadedGraph || graph.nodes.isEmpty) {
+      return const EndpointProbeResult(
+        isOnTrack: false,
+        errors: ['Graph data unavailable'],
+      );
+    }
+
+    final classification = _classifyEndpoint(graph, point, maxSnapDistanceMeters);
+    return EndpointProbeResult(
+      isOnTrack: classification.isOnTrack,
+      anchor: classification.anchor,
+      errors: classification.isOnTrack ? const [] : const [],
+    );
+  }
+
+  int _nextSyntheticNodeId(Graph graph, int currentMinId) {
+    final minId = graph.nodes.keys.isEmpty
+        ? currentMinId
+        : graph.nodes.keys.reduce(math.min);
+    return math.min(currentMinId, minId) - 1;
+  }
+
+  AnchoredSegmentResult _routeThroughOverlay(
+    Graph baseGraph,
+    _EndpointClassification start,
+    _EndpointClassification end,
+  ) {
+    if (start.anchor == null || end.anchor == null) {
+      return const AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.failed,
+        route: [],
+        distance: 0.0,
+        errors: ['Missing anchor metadata'],
+      );
+    }
+
+    if (start.originalSegmentId != null &&
+        start.originalSegmentId == end.originalSegmentId &&
+        start.anchor!.type == EndpointAnchorType.edgeProjection &&
+        end.anchor!.type == EndpointAnchorType.edgeProjection) {
+      final distance = haversineDistance(
+        start.anchor!.point.latitude,
+        start.anchor!.point.longitude,
+        end.anchor!.point.latitude,
+        end.anchor!.point.longitude,
+      );
+      return AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.routed,
+        route: [start.anchor!.point, end.anchor!.point],
+        distance: distance,
+        errors: const [],
+        startAnchor: start.anchor,
+        endAnchor: end.anchor,
+      );
+    }
+
+    final overlay = baseGraph.clone();
+    var syntheticId = 0;
+
+    int resolveNodeId(_EndpointClassification classification) {
+      final nodeId = classification.graphNodeId;
+      if (nodeId != null) {
+        return nodeId;
+      }
+
+      final fromId = classification.segmentFromNodeId;
+      final toId = classification.segmentToNodeId;
+      final fraction = classification.fractionAlongSegment;
+      final anchor = classification.anchor;
+      if (fromId == null || toId == null || fraction == null || anchor == null) {
+        throw StateError('Missing synthetic anchor routing metadata.');
+      }
+
+      syntheticId = _nextSyntheticNodeId(overlay, syntheticId);
+      final fromNode = overlay.nodes[fromId]!;
+      final toNode = overlay.nodes[toId]!;
+      overlay.addNode(
+        Node(
+          syntheticId,
+          anchor.point.latitude,
+          anchor.point.longitude,
+          fromNode.isFootWay || toNode.isFootWay,
+        ),
+      );
+
+      final segmentId = classification.originalSegmentId;
+      final totalWeight = haversineDistance(
+        fromNode.lat,
+        fromNode.lon,
+        toNode.lat,
+        toNode.lon,
+      );
+      overlay.addEdge(
+        Edge(
+          fromId,
+          syntheticId,
+          totalWeight * fraction,
+          originalSegmentId: segmentId,
+        ),
+      );
+      overlay.addEdge(
+        Edge(
+          syntheticId,
+          toId,
+          totalWeight * (1.0 - fraction),
+          originalSegmentId: segmentId,
+        ),
+      );
+      return syntheticId;
+    }
+
+    try {
+      final startId = resolveNodeId(start);
+      final endId = resolveNodeId(end);
+      final trip = shortestPath(overlay, startId, endId);
+      if (trip.errors.isNotEmpty || trip.route.length < 2 || trip.distance <= 0) {
+        return AnchoredSegmentResult(
+          status: AnchoredSegmentStatus.noPath,
+          route: const [],
+          distance: 0.0,
+          errors: const [],
+          startAnchor: start.anchor,
+          endAnchor: end.anchor,
+        );
+      }
+      return AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.routed,
+        route: trip.route,
+        distance: trip.distance,
+        errors: const [],
+        startAnchor: start.anchor,
+        endAnchor: end.anchor,
+      );
+    } catch (error) {
+      return AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.failed,
+        route: const [],
+        distance: 0.0,
+        errors: ['$error'],
+        startAnchor: start.anchor,
+        endAnchor: end.anchor,
+      );
+    }
+  }
+
+  Future<AnchoredSegmentResult> findAnchoredSegment({
+    required LatLng start,
+    required LatLng end,
+    required double maxSnapDistanceMeters,
+  }) async {
+    if (!_hasLoadedGraph || graph.nodes.isEmpty) {
+      return const AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.failed,
+        route: [],
+        distance: 0.0,
+        errors: ['Graph data unavailable'],
+      );
+    }
+
+    final startClassification = _classifyEndpoint(graph, start, maxSnapDistanceMeters);
+    final endClassification = _classifyEndpoint(graph, end, maxSnapDistanceMeters);
+    if (!startClassification.isOnTrack || !endClassification.isOnTrack) {
+      return AnchoredSegmentResult(
+        status: AnchoredSegmentStatus.offTrack,
+        route: const [],
+        distance: 0.0,
+        errors: const [],
+        startAnchor: startClassification.anchor,
+        endAnchor: endClassification.anchor,
+      );
+    }
+
+    return _routeThroughOverlay(graph, startClassification, endClassification);
   }
 
   /// Find the closest node id in graph for each position.
@@ -596,7 +921,7 @@ class TripService {
   Future<bool> useCity(String cityName) async {
     final filePath = await getCityPath(cityName);
     try {
-      graph = await graph.loadGraph(filePath);
+      graph = await Graph().loadGraph(filePath);
       currentCity = cityName;
       return true;
     } catch (_) {
@@ -652,4 +977,42 @@ class TripService {
     }
     return null;
   }
+}
+
+class _GraphSegment {
+  const _GraphSegment(this.edge, this.startNode, this.endNode);
+
+  final Edge edge;
+  final Node startNode;
+  final Node endNode;
+}
+
+class _ProjectedPoint {
+  const _ProjectedPoint(this.point, this.fraction, this.distanceMeters);
+
+  final LatLng point;
+  final double fraction;
+  final double distanceMeters;
+}
+
+class _EndpointClassification {
+  const _EndpointClassification({
+    required this.isOnTrack,
+    this.anchor,
+    this.graphNodeId,
+    this.originalSegmentId,
+    this.segmentFromNodeId,
+    this.segmentToNodeId,
+    this.fractionAlongSegment,
+    this.distanceToGraphMeters,
+  });
+
+  final bool isOnTrack;
+  final EndpointAnchor? anchor;
+  final int? graphNodeId;
+  final String? originalSegmentId;
+  final int? segmentFromNodeId;
+  final int? segmentToNodeId;
+  final double? fractionAlongSegment;
+  final double? distanceToGraphMeters;
 }
