@@ -82,6 +82,34 @@ class TripService {
     );
   }
 
+  Future<void> loadOverpassTilePayloads(
+    List<Map<String, dynamic>> payloads, {
+    bool preferWalkingPaths = true,
+    int minIslandSize = 0,
+    String source = 'custom',
+  }) async {
+    final elements = <Map<String, dynamic>>[];
+    for (final payload in payloads) {
+      final payloadElements = payload['elements'];
+      if (payloadElements is! List) {
+        continue;
+      }
+
+      elements.addAll(
+        payloadElements.whereType<Map>().map((element) {
+          return Map<String, dynamic>.from(element);
+        }),
+      );
+    }
+
+    await loadOverpassElements(
+      elements,
+      preferWalkingPaths: preferWalkingPaths,
+      minIslandSize: minIslandSize,
+      source: source,
+    );
+  }
+
   /// Fetch OSM walking path ways/nodes in given bounds.
   ///
   /// Returns an empty list if parsing fails, data is incomplete, or API fails.
@@ -220,14 +248,16 @@ class TripService {
             lon is double &&
             lat.isFinite &&
             lon.isFinite) {
-          try {
-            graph.addNode(Node(
-              id,
-              lat,
-              lon,
-              false,
-            ));
-          } catch (_) {}
+          if (!graph.nodes.containsKey(id)) {
+            try {
+              graph.addNode(Node(
+                id,
+                lat,
+                lon,
+                false,
+              ));
+            } catch (_) {}
+          }
         }
       }
     }
